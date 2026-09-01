@@ -1440,7 +1440,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor, torch.Tensor]:
-    ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor, torch.Tensor]:
         shard_metadata = None
         global_input_batch = input_batch
         if self.batch_sharder is not None:
