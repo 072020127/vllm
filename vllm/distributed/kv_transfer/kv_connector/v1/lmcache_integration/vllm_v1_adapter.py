@@ -3,7 +3,7 @@
 # Standard
 import os
 import uuid
-from collections.abc import Generator
+from collections.abc import Generator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -27,6 +27,7 @@ from lmcache.v1.lookup_client.lmcache_async_lookup_client import (
     LMCacheAsyncLookupServer,
 )
 from lmcache.v1.offload_server.zmq_server import ZMQOffloadServer
+from lmcache.v1.storage_backend.makv.runtime_risk import RuntimeRiskDispatcher
 
 try:
     from lmcache.v1.plugin.runtime_plugin_launcher import RuntimePluginLauncher
@@ -657,6 +658,29 @@ class LMCacheConnectorV1Impl:
 
         # request_id -> full_token_ids
         self._request_trackers: dict[str, RequestTracker] = {}
+        self._runtime_risk_dispatcher: RuntimeRiskDispatcher | None = None
+        if (
+            role != KVConnectorRole.SCHEDULER
+            and self.lmcache_engine is not None
+            and config.remote_serde == "makv"
+            and config.get_extra_config_value("makv_real_risk_enabled", False)
+        ):
+            queue_depth = int(
+                config.get_extra_config_value("makv_real_risk_queue_depth", 128)
+            )
+            window_tokens = int(
+                config.get_extra_config_value("makv_risk_window_tokens", 16)
+            )
+            self._runtime_risk_dispatcher = RuntimeRiskDispatcher(
+                self._send_runtime_risk,
+                max_queue=queue_depth,
+                window_tokens=window_tokens,
+            )
+            logger.info(
+                "Enabled opt-in MaKV runtime risk observer: queue=%d window=%d",
+                queue_depth,
+                window_tokens,
+            )
 
         # Whether to discard partial chunks
         self._discard_partial_chunks = (
@@ -1132,6 +1156,88 @@ class LMCacheConnectorV1Impl:
         self, finished_req_ids: set[str]
     ) -> tuple[set[str] | None, set[str] | None]:
         return None, None
+
+    def submit_precision_risk(
+        self,
+        request_id: str,
+        logits: torch.Tensor,
+        step: int,
+        token_index: int,
+        prompt_token_ids: Sequence[int],
+        request_params: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """Queue an opt-in real decode-logit MaKV risk observation."""
+        dispatcher = self._runtime_risk_dispatcher
+        if dispatcher is None:
+            logger.warning("MaKV runtime risk dispatcher is unavailable")
+            return False
+        if self.lmcache_engine is None:
+            logger.warning("MaKV runtime risk LMCache engine is unavailable")
+            return False
+        tracker = self._request_trackers.get(request_id)
+        if tracker is not None:
+            if len(prompt_token_ids) != tracker.prompt_len:
+                logger.warning(
+                    "MaKV runtime risk prompt length mismatch for %s: "
+                    "observed=%d tracker=%d",
+                    request_id,
+                    len(prompt_token_ids),
+                    tracker.prompt_len,
+                )
+                return False
+            prompt_tokens = tracker.token_ids[: tracker.prompt_len]
+            if len(prompt_tokens) != tracker.prompt_len:
+                logger.warning(
+                    "MaKV runtime risk tracker token length mismatch for %s: "
+                    "observed=%d expected=%d",
+                    request_id,
+                    len(prompt_tokens),
+                    tracker.prompt_len,
+                )
+                return False
+            request_configs = tracker.request_configs
+        else:
+            prompt_tokens = list(prompt_token_ids)
+            request_configs = {
+                key: value
+                for key, value in (request_params or {}).items()
+                if key.startswith("lmcache.")
+            }
+        accepted = dispatcher.submit(
+            request_id,
+            prompt_tokens,
+            token_index,
+            logits,
+            step=step,
+            request_configs=request_configs,
+        )
+        if not accepted:
+            logger.warning(
+                "MaKV runtime risk observation dropped for request %s at "
+                "token %d: %s",
+                request_id,
+                token_index,
+                dispatcher.stats(),
+            )
+        return accepted
+
+    def _send_runtime_risk(
+        self,
+        request_id: str,
+        prompt_token_ids: Sequence[int],
+        token_index: int,
+        signal: Any,
+        request_configs: Mapping[str, Any] | None,
+    ) -> Mapping[str, Any] | None:
+        if self.lmcache_engine is None:
+            return {"accepted": False, "reason": "engine_unavailable"}
+        del request_id
+        return self.lmcache_engine.report_precision_risk(
+            list(prompt_token_ids),
+            token_index,
+            signal.as_dict(),
+            request_configs=None if request_configs is None else dict(request_configs),
+        )
 
     ###################
     # Scheduler side APIs

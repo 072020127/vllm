@@ -20,6 +20,7 @@ instead of embedding feature-specific logic directly.
 import functools
 import gc
 import time
+from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any, NamedTuple
 
@@ -119,6 +120,10 @@ from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.makv_runtime_risk import (
+    RuntimeRiskRequestContext,
+    submit_makv_runtime_risk_v2,
+)
 from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
 
 logger = init_logger(__name__)
@@ -276,6 +281,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
+
+        # V2 keeps compact MaKV observer context instead of Request objects.
+        # Entries are created only for requests that explicitly opt in through
+        # kv_transfer_params, so existing connectors and modes remain inert.
+        self._makv_runtime_contexts: dict[str, RuntimeRiskRequestContext] = {}
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
@@ -811,6 +821,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.prompt_logprobs_worker is not None:
             self.prompt_logprobs_worker.remove_request(req_id)
         self.lora_state.remove_request(req_id)
+        self._makv_runtime_contexts.pop(req_id, None)
         return True
 
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
@@ -850,6 +861,36 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             prompt_len = len(new_req_data.prompt_token_ids)
             sampling_params = new_req_data.sampling_params
+            if sampling_params is not None:
+                extra_args = sampling_params.extra_args
+                request_params = (
+                    extra_args.get("kv_transfer_params")
+                    if isinstance(extra_args, Mapping)
+                    else None
+                )
+                if (
+                    isinstance(request_params, Mapping)
+                    and request_params.get("lmcache.makv.risk_token_indices")
+                    is not None
+                ):
+                    risk_positions = request_params.get(
+                        "lmcache.makv.risk_token_indices"
+                    )
+                    self._makv_runtime_contexts[req_id] = (
+                        RuntimeRiskRequestContext(
+                            prompt_token_ids=tuple(new_req_data.prompt_token_ids),
+                            request_params=dict(request_params),
+                        )
+                    )
+                    logger.info_once(
+                        "MaKV V2 runtime risk context registered: req=%s "
+                        "prompt=%d positions=%d",
+                        req_id,
+                        prompt_len,
+                        len(risk_positions)
+                        if isinstance(risk_positions, (list, tuple))
+                        else -1,
+                    )
             self.req_states.add_request(
                 req_id=req_id,
                 prompt_len=prompt_len,
@@ -1145,7 +1186,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states: torch.Tensor,
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
-    ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
+    ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor, torch.Tensor]:
         sample_hidden_states = hidden_states[input_batch.logits_indices]
         logits = self.model.compute_logits(sample_hidden_states)
         if grammar_output is not None:
@@ -1172,7 +1213,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.speculator.draft_logits,
             )
 
-        return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
+        return (
+            sampler_output,
+            sampler_output.num_sampled,
+            sampler_output.num_rejected,
+            logits,
+        )
 
     def postprocess_sampled(
         self,
@@ -1492,9 +1538,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.pcp_manager, hidden_states, input_batch
         )
 
-        sampler_output, num_sampled, num_rejected = self.sample(
+        sampler_output, num_sampled, num_rejected, logits = self.sample(
             hidden_states, input_batch, grammar_output
         )
+
+        # The V2 runner owns the actual decode logits and CPU scheduler mirrors.
+        # Keep this feature-specific logic in a helper; non-opted-in requests
+        # and all non-MaKV connectors take the zero-cost empty-context path.
+        if self._makv_runtime_contexts:
+            active_connector = getattr(self.kv_connector, "kv_connector", None)
+            submit_makv_runtime_risk_v2(
+                active_connector,
+                logits,
+                input_batch.req_ids,
+                input_batch.num_scheduled_tokens,
+                input_batch.num_computed_tokens_np,
+                self.req_states.prompt_len.np[input_batch.idx_mapping_np],
+                self._makv_runtime_contexts,
+            )
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -227,6 +227,34 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         # Fallback for older versions that don't support this method
         return set()
 
+    def submit_precision_risk(
+        self,
+        request_id: str,
+        logits: torch.Tensor,
+        step: int,
+        token_index: int,
+        prompt_token_ids: list[int],
+        request_params: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """Forward an opt-in real-logit MaKV risk observation.
+
+        Older LMCache adapters do not implement this experiment-only API, so
+        the normal ``naive`` and ``cachegen`` paths remain unchanged.
+        """
+        method = getattr(self._lmcache_engine, "submit_precision_risk", None)
+        if not callable(method):
+            return False
+        return bool(
+            method(
+                request_id,
+                logits,
+                step,
+                token_index,
+                prompt_token_ids,
+                request_params,
+            )
+        )
+
     def get_kv_connector_kv_cache_events(self) -> LMCacheKVEvents | None:
         """
         Get the KV connector kv cache events collected during the last interval.
@@ -338,6 +366,13 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             returned by the engine.
         """
         return self._lmcache_engine.request_finished(request, block_ids)
+
+    def shutdown(self):
+        """Shutdown the underlying LMCache adapter and runtime observers."""
+        method = getattr(self._lmcache_engine, "shutdown", None)
+        if callable(method):
+            return method()
+        return super().shutdown()
 
     def take_events(self) -> Iterable["KVCacheEvent"]:
         """

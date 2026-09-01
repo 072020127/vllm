@@ -224,6 +224,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.makv_runtime_risk import submit_makv_runtime_risk
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
     check_ubatch_thresholds,
@@ -4569,6 +4570,15 @@ class GPUModelRunner(
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
+
+        if has_kv_transfer_group():
+            submit_makv_runtime_risk(
+                get_kv_transfer_group(),
+                logits,
+                self.input_batch.req_ids,
+                self.requests,
+                scheduler_output.num_scheduled_tokens,
+            )
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
